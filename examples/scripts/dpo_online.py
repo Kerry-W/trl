@@ -41,17 +41,14 @@ python examples/scripts/dpo_online.py \
 """
 
 import torch
-from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig
 
 from trl import (
-    HfPairwiseJudge,
     LogCompletionsCallback,
     ModelConfig,
     OnlineDPOConfig,
     OnlineDPOTrainer,
-    OpenAIPairwiseJudge,
-    PairRMJudge,
+    BasePairwiseJudge,
     ScriptArguments,
     TrlParser,
     get_kbit_device_map,
@@ -59,13 +56,56 @@ from trl import (
     get_quantization_config,
 )
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+from torch.utils.data import Dataset
+import json
+import os
 
+class DpoDataset(Dataset):
+    def __init__(self, file_path):
+        self.data = []
+        with open(file_path, "r") as f:
+            for line in f.readlines():
+                self.data.append(json.loads(line))
+    
+    def __len__(self):
+        return len(self.data)
 
-JUDGES = {"pair_rm": PairRMJudge, "openai": OpenAIPairwiseJudge, "hf": HfPairwiseJudge}
+    def __getitem__(self, idx):
+        return {
+            "prompt": [self.data[idx]["messages"][0]],
+            "completion": [self.data[idx]["messages"][1]],
+        }
+
+class GSM8kJudge(BasePairwiseJudge):
+    def judge(self, prompts: list[str], completions: list[list[str]], answers: list[str], shuffle_order: bool = False) -> list[int]:
+        ranks = []
+        for completion, answer in zip(completions, answers):
+            answer = answer[0]["content"].split("####")[-1].strip()
+            pred0 = completion[0].split("####")[-1].strip()
+            pred1 = completion[1].split("####")[-1].strip()
+            if pred0 == answer and pred1 == answer:
+                ranks.append(1 if len(completion[0]) > len(completion[1]) else 0)
+            elif pred0 == answer:
+                ranks.append(0)
+            elif pred1 == answer:
+                ranks.append(1)
+            else:
+                ranks.append(-1)
+        # if int(os.environ.get('LOCAL_RANK', 0)) == 0:
+        #     for i in range(8):
+        #         print(completions[i][0])
+        #         print(completions[i][1])
+        #         print(answers[i][0]["content"])
+        #         print(ranks[i])
+        #         print()
+        return ranks
+
+JUDGES = {"GSM8kJudge": GSM8kJudge}
 
 if __name__ == "__main__":
     parser = TrlParser((ScriptArguments, OnlineDPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    # if int(os.environ.get('LOCAL_RANK', 0)) == 0:
     training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}
 
     torch_dtype = (
@@ -82,6 +122,9 @@ if __name__ == "__main__":
     )
 
     model = AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+    )
+    ref_model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
 
@@ -119,15 +162,16 @@ if __name__ == "__main__":
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
 
     trainer = OnlineDPOTrainer(
         model=model,
         reward_model=reward_model,
+        ref_model=ref_model,
         judge=judge,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        train_dataset=DpoDataset(os.path.join(script_args.dataset_name, "train_test.jsonl")),
+        eval_dataset=DpoDataset(os.path.join(script_args.dataset_name, "test.jsonl")),
         processing_class=tokenizer,
         reward_processing_class=reward_tokenizer,
         peft_config=get_peft_config(model_args),
@@ -139,10 +183,184 @@ if __name__ == "__main__":
         )
         completions_callback = LogCompletionsCallback(trainer, generation_config, num_prompts=8)
         trainer.add_callback(completions_callback)
-
     trainer.train()
 
     # Save and push to hub
     trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+    # if training_args.push_to_hub:
+    #     trainer.push_to_hub(dataset_name=script_args.dataset_name)
+
+"""
+ScriptArguments(
+    dataset_name='../data/gsm8k',
+    dataset_config=None,
+    dataset_train_split='train',
+    dataset_test_split='test',
+    gradient_checkpointing_use_reentrant=False,
+    ignore_bias_buffers=False
+)
+
+OnlineDPOConfig(
+    _n_gpu=1,
+    accelerator_config={'split_batches': False, 'dispatch_batches': None, 'even_batches': True, 'use_seedable_sampler': True, 'non_blocking': False, 'gradient_accumulation_kwargs': None, 'use_configured_state': False},
+    adafactor=False,
+    adam_beta1=0.9,
+    adam_beta2=0.999,
+    adam_epsilon=1e-08,
+    auto_find_batch_size=False,
+    average_tokens_across_devices=False,
+    batch_eval_metrics=False,
+    beta=0.1,
+    bf16=False,
+    bf16_full_eval=False,
+    data_seed=None,
+    dataloader_drop_last=False,
+    dataloader_num_workers=0,
+    dataloader_persistent_workers=False,
+    dataloader_pin_memory=True,
+    dataloader_prefetch_factor=None,
+    dataset_num_proc=None,
+    ddp_backend=None,
+    ddp_broadcast_buffers=None,
+    ddp_bucket_cap_mb=None,
+    ddp_find_unused_parameters=None,
+    ddp_timeout=1800,
+    debug=[],
+    deepspeed=None,
+    disable_dropout=True,
+    disable_tqdm=False,
+    dispatch_batches=None,
+    do_eval=False,
+    do_predict=False,
+    do_train=False,
+    ds3_gather_for_generation=True,
+    eval_accumulation_steps=None,
+    eval_delay=0,
+    eval_do_concat_batches=True,
+    eval_on_start=False,
+    eval_steps=None,
+    eval_strategy=no,
+    eval_use_gather_object=False,
+    evaluation_strategy=None,
+    fp16=False,
+    fp16_backend=auto,
+    fp16_full_eval=False,
+    fp16_opt_level=O1,
+    fsdp=[],
+    fsdp_config={'min_num_params': 0, 'xla': False, 'xla_fsdp_v2': False, 'xla_fsdp_grad_ckpt': False},
+    fsdp_min_num_params=0,
+    fsdp_transformer_layer_cls_to_wrap=None,
+    full_determinism=False,
+    gradient_accumulation_steps=16,
+    gradient_checkpointing=False,
+    gradient_checkpointing_kwargs=None,
+    greater_is_better=None,
+    group_by_length=False,
+    half_precision_backend=auto,
+    hub_always_push=False,
+    hub_model_id=None,
+    hub_private_repo=None,
+    hub_strategy=every_save,
+    hub_token=<HUB_TOKEN>,
+    ignore_data_skip=False,
+    include_for_metrics=[],
+    include_inputs_for_metrics=False,
+    include_num_input_tokens_seen=False,
+    include_tokens_per_second=False,
+    jit_mode_eval=False,
+    judge=GSM8kJudge,
+    label_names=None,
+    label_smoothing_factor=0.0,
+    learning_rate=5e-07,
+    length_column_name=length,
+    load_best_model_at_end=False,
+    local_rank=0,
+    log_level=passive,
+    log_level_replica=warning,
+    log_on_each_node=True,
+    logging_dir=../result/gsm8k_dpo/runs/Jan27_15-45-38_n124-253-169,
+    logging_first_step=False,
+    logging_nan_inf_filter=True,
+    logging_steps=500,
+    logging_strategy=steps,
+    loss_type=sigmoid,
+    lr_scheduler_kwargs={},
+    lr_scheduler_type=linear,
+    max_grad_norm=1.0,
+    max_length=512,
+    max_new_tokens=64,
+    max_steps=5000,
+    metric_for_best_model=None,
+    missing_eos_penalty=None,
+    mp_parameters=,
+    neftune_noise_alpha=None,
+    no_cuda=False,
+    num_train_epochs=3.0,
+    optim=adamw_torch,
+    optim_args=None,
+    optim_target_modules=None,
+    output_dir=../result/gsm8k_dpo,
+    overwrite_output_dir=False,
+    past_index=-1,
+    per_device_eval_batch_size=8,
+    per_device_train_batch_size=8,
+    prediction_loss_only=False,
+    push_to_hub=False,
+    push_to_hub_model_id=None,
+    push_to_hub_organization=None,
+    push_to_hub_token=<PUSH_TO_HUB_TOKEN>,
+    ray_scope=last,
+    remove_unused_columns=True,
+    report_to=[],
+    restore_callback_states_from_checkpoint=False,
+    resume_from_checkpoint=None,
+    reward_model_path=None,
+    run_name=../result/gsm8k_dpo,
+    save_on_each_node=False,
+    save_only_model=False,
+    save_safetensors=True,
+    save_steps=500,
+    save_strategy=steps,
+    save_total_limit=None,
+    seed=42,
+    skip_memory_metrics=True,
+    split_batches=None,
+    temperature=0.9,
+    tf32=None,
+    torch_compile=False,
+    torch_compile_backend=None,
+    torch_compile_mode=None,
+    torch_empty_cache_steps=None,
+    torchdynamo=None,
+    tpu_metrics_debug=False,
+    tpu_num_cores=None,
+    use_cpu=False,
+    use_ipex=False,
+    use_legacy_prediction_loop=False,
+    use_liger_kernel=False,
+    use_mps_device=False,
+    use_vllm=False,
+    warmup_ratio=0.1,
+    warmup_steps=0,
+    weight_decay=0.0,
+)
+
+ModelConfig(model_name_or_path='../result/gsm8k_sft',
+    model_revision='main',
+    torch_dtype=None,
+    trust_remote_code=False,
+    attn_implementation=None,
+    use_peft=False,
+    lora_r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    lora_target_modules=None,
+    lora_modules_to_save=None,
+    lora_task_type='CAUSAL_LM',
+    use_rslora=False,
+    load_in_8bit=False,
+    load_in_4bit=False,
+    bnb_4bit_quant_type='nf4',
+    use_bnb_nested_quant=False
+)
+"""

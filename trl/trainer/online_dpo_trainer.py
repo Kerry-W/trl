@@ -238,6 +238,8 @@ class OnlineDPOTrainer(Trainer):
             "rewards/rejected": [],
             "rewards/accuracies": [],
             "rewards/margins": [],
+            "rewards/length": [],
+            "rewards/accuracy": [],
             "logps/chosen": [],
             "logps/rejected": [],
             "val/contain_eos_token": [],
@@ -469,7 +471,7 @@ class OnlineDPOTrainer(Trainer):
         # policies with different tokenizers / chat templates.
         inputs = [{"prompt": prompt} for prompt in prompts]
         inputs = [maybe_apply_chat_template(x, self.processing_class) for x in inputs]
-        inputs = [self.tokenize_row(x, model.config.is_encoder_decoder, self.processing_class) for x in inputs]
+        inputs = [self.tokenize_row(x, True, self.processing_class) for x in inputs]
         inputs = self.data_collator(inputs)
 
         # Sample 2 completions per prompt of size `max_new_tokens` from the model
@@ -554,13 +556,14 @@ class OnlineDPOTrainer(Trainer):
                 completions = [template.render(messages=completion) for completion in completions]
 
             ranks_of_first_completion = self.judge.judge(
-                prompts, list(zip(completions[:batch_size], completions[batch_size:]))
+                prompts, list(zip(completions[:batch_size], completions[batch_size:])), inputs["completion"]
             )
 
             # convert ranks to a True/False mask:
             # when rank == 0, it means the first completion is the best
             # when rank == 1, it means the second completion is the best
             mask = torch.tensor([rank == 0 for rank in ranks_of_first_completion], device=device)
+            mask_1 = torch.tensor([rank == -1 for rank in ranks_of_first_completion], device=device)
         else:
             # The reward model may not have the same chat template or tokenizer as the model, so we need to use the
             # raw data (string), apply the chat template (if needed), and tokenize it with the reward processing class.
@@ -612,17 +615,30 @@ class OnlineDPOTrainer(Trainer):
         # mask out the padding tokens
         padding_mask = ~completion_mask.bool()
         cr_padding_mask = padding_mask[cr_indices]
-
         cr_logprobs_sum = (cr_logprobs * ~cr_padding_mask).sum(1)
         cr_ref_logprobs_sum = (cr_ref_logprobs * ~cr_padding_mask).sum(1)
 
         # Split the chosen and rejected examples
         chosen_logprobs_sum, rejected_logprobs_sum = torch.split(cr_logprobs_sum, batch_size)
         chosen_ref_logprobs_sum, rejected_ref_logprobs_sum = torch.split(cr_ref_logprobs_sum, batch_size)
-        pi_logratios = chosen_logprobs_sum - rejected_logprobs_sum
-        ref_logratios = chosen_ref_logprobs_sum - rejected_ref_logprobs_sum
 
+        chosen_wrong_logprobs_sum = chosen_logprobs_sum * (mask_1) 
+        chosen_right_logprobs_sum = chosen_logprobs_sum * (~ mask_1) 
+        rejected_wrong_logprobs_sum = rejected_logprobs_sum * (mask_1)
+        rejected_right_logprobs_sum = rejected_logprobs_sum * (~ mask_1)
+        chosen_ref_wrong_logprobs_sum = chosen_ref_logprobs_sum * (mask_1)
+        chosen_ref_right_logprobs_sum = chosen_ref_logprobs_sum * (~ mask_1)
+        rejected_ref_wrong_logprobs_sum = rejected_ref_logprobs_sum * (mask_1)
+        rejected_ref_right_logprobs_sum = rejected_ref_logprobs_sum * (~ mask_1)
+
+        pi_logratios = chosen_right_logprobs_sum - rejected_right_logprobs_sum
+        ref_logratios = chosen_ref_right_logprobs_sum - rejected_ref_right_logprobs_sum
         logits = pi_logratios - ref_logratios
+
+        penalty_chosen_logratios = chosen_wrong_logprobs_sum - chosen_ref_wrong_logprobs_sum
+        penalty_rejected_logratios = rejected_wrong_logprobs_sum - rejected_ref_wrong_logprobs_sum
+        penalty_term = torch.maximum(torch.zeros_like(penalty_chosen_logratios), penalty_chosen_logratios) + torch.maximum(torch.zeros_like(penalty_rejected_logratios), penalty_rejected_logratios)
+        logits -= penalty_term # add lambda
 
         if self.args.loss_type == "sigmoid":
             losses = -F.logsigmoid(self.beta * logits)
@@ -634,6 +650,8 @@ class OnlineDPOTrainer(Trainer):
         loss = losses.mean()
 
         # Log everything
+        self.stats["rewards/length"].append(self.accelerator.gather_for_metrics(torch.mean(torch.sum(completion_mask, dim=1).to(torch.float), dim=0)).mean().item())
+        self.stats["rewards/accuracy"].append(self.accelerator.gather_for_metrics(((~mask_1).sum()/mask_1.numel())).mean().item())
         if self.reward_model is not None:
             scores_margin = scores[chosen_indices] - scores[rejected_indices]
             self.stats["objective/scores_margin"].append(
