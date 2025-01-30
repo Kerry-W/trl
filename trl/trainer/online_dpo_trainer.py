@@ -650,8 +650,11 @@ class OnlineDPOTrainer(Trainer):
         loss = losses.mean()
 
         # Log everything
+        metrics = {}
         self.stats["rewards/length"].append(self.accelerator.gather_for_metrics(torch.mean(torch.sum(completion_mask, dim=1).to(torch.float), dim=0)).mean().item())
+        metrics["rewards/length"] = self.stats["rewards/length"][-1]
         self.stats["rewards/accuracy"].append(self.accelerator.gather_for_metrics(((~mask_1).sum()/mask_1.numel())).mean().item())
+        metrics["rewards/accuracy"] = self.stats["rewards/accuracy"][-1]
         if self.reward_model is not None:
             scores_margin = scores[chosen_indices] - scores[rejected_indices]
             self.stats["objective/scores_margin"].append(
@@ -659,33 +662,45 @@ class OnlineDPOTrainer(Trainer):
             )
             self.stats["objective/scores"].append(self.accelerator.gather_for_metrics(scores.mean()).mean().item())
         self.stats["val/contain_eos_token"].append(contain_eos_token.float().mean().item())
+        metrics["val/contain_eos_token"] = self.stats["val/contain_eos_token"][-1]    
         self.stats["logps/chosen"].append(self.accelerator.gather_for_metrics(chosen_logprobs_sum).mean().item())
+        metrics["logps/chosen"] = self.stats["logps/chosen"][-1]   
         self.stats["logps/rejected"].append(self.accelerator.gather_for_metrics(rejected_logprobs_sum).mean().item())
+        metrics["logps/rejected"] = self.stats["logps/rejected"][-1]   
 
         kl = logprobs - ref_logprobs
         mean_kl = kl.sum(1).mean()
         self.stats["objective/kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        metrics["objective/kl"] = self.stats["objective/kl"][-1]   
         non_score_reward = (-self.beta * kl).sum(1)
         mean_non_score_reward = non_score_reward.mean()
         self.stats["objective/non_score_reward"].append(
             self.accelerator.gather_for_metrics(mean_non_score_reward).mean().item()
         )
+        metrics["objective/non_score_reward"] = self.stats["objective/non_score_reward"][-1]   
         if self.reward_model is not None:
             rlhf_reward = scores + non_score_reward
             self.stats["objective/rlhf_reward"].append(self.accelerator.gather_for_metrics(rlhf_reward).mean().item())
         mean_entropy = -logprobs.sum(1).mean()
         self.stats["objective/entropy"].append(self.accelerator.gather_for_metrics(mean_entropy).mean().item())
+        metrics["objective/entropy"] = self.stats["objective/entropy"][-1]   
         chosen_rewards = self.beta * (chosen_logprobs_sum - chosen_ref_logprobs_sum)
         gathered_chosen_rewards = self.accelerator.gather_for_metrics(chosen_rewards)
         self.stats["rewards/chosen"].append(gathered_chosen_rewards.mean().item())
+        metrics["rewards/chosen"] = self.stats["rewards/chosen"][-1]   
         rejected_rewards = self.beta * (rejected_logprobs_sum - rejected_ref_logprobs_sum)
         gathered_rejected_rewards = self.accelerator.gather_for_metrics(rejected_rewards)
         self.stats["rewards/rejected"].append(gathered_rejected_rewards.mean().item())
+        metrics["rewards/rejected"] = self.stats["rewards/rejected"][-1]   
         margin = gathered_chosen_rewards - gathered_rejected_rewards
         self.stats["rewards/margins"].append(margin.mean().item())
+        metrics["rewards/margins"] = self.stats["rewards/margins"][-1]   
         accuracy = margin > 0
         self.stats["rewards/accuracies"].append(accuracy.float().mean().item())
+        metrics["rewards/accuracies"] = self.stats["rewards/accuracies"][-1]   
         self.stats["beta"].append(self.beta)
+        metrics["objective/non_score_reward"] = self.stats["objective/non_score_reward"][-1]   
+        self.log(metrics)
 
         if (
             self.args.torch_empty_cache_steps is not None
