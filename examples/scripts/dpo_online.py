@@ -59,6 +59,7 @@ from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 from torch.utils.data import Dataset
 import json
 import os
+import re
 
 class DpoDataset(Dataset):
     def __init__(self, file_path):
@@ -91,16 +92,35 @@ class GSM8kJudge(BasePairwiseJudge):
                 ranks.append(1)
             else:
                 ranks.append(-1)
-        # if int(os.environ.get('LOCAL_RANK', 0)) == 0:
-        #     for i in range(8):
-        #         print(completions[i][0])
-        #         print(completions[i][1])
-        #         print(answers[i][0]["content"])
-        #         print(ranks[i])
-        #         print()
         return ranks
 
-JUDGES = {"GSM8kJudge": GSM8kJudge}
+class MATHJudge(BasePairwiseJudge):
+    def judge(self, prompts: list[str], completions: list[list[str]], answers: list[str], shuffle_order: bool = False) -> list[int]:
+        ranks = []
+        pattern = r'boxed\{(.*)\}'
+        for completion, answer in zip(completions, answers):
+            answer = re.search(pattern, answer[0]["content"]).group(1)
+            match = re.search(pattern, completion[0])
+            if match:
+                pred0 = match.group(1)
+            else:
+                pred0 = ""
+            match = re.search(pattern, completion[1])
+            if match:
+                pred1 = match.group(1)
+            else:
+                pred1 = ""
+            if pred0 == answer and pred1 == answer:
+                ranks.append(1 if len(completion[0]) > len(completion[1]) else 0)
+            elif pred0 == answer:
+                ranks.append(0)
+            elif pred1 == answer:
+                ranks.append(1)
+            else:
+                ranks.append(-1)
+        return ranks
+
+JUDGES = {"GSM8kJudge": GSM8kJudge, "MATHJudge": MATHJudge}
 
 if __name__ == "__main__":
     parser = TrlParser((ScriptArguments, OnlineDPOConfig, ModelConfig))
