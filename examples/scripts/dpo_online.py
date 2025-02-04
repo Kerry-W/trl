@@ -60,6 +60,15 @@ from torch.utils.data import Dataset
 import json
 import os
 import re
+from grader import grade_answer
+
+import wandb
+wandb.login(key="214125030792bd6cfd84015505ed93487f714a59")
+import os
+if int(os.environ.get('LOCAL_RANK', 0)) == 0:
+    wandb.init(
+        project="cot",
+    )
 
 class DpoDataset(Dataset):
     def __init__(self, file_path):
@@ -73,8 +82,8 @@ class DpoDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            "prompt": [self.data[idx]["messages"][0]],
-            "completion": [self.data[idx]["messages"][1]],
+            "prompt": [self.data[idx]["messages"][0], self.data[idx]["messages"][1]],
+            "completion": [self.data[idx]["messages"][2]],
         }
 
 class GSM8kJudge(BasePairwiseJudge):
@@ -99,22 +108,22 @@ class MATHJudge(BasePairwiseJudge):
         ranks = []
         pattern = r'boxed\{(.*)\}'
         for completion, answer in zip(completions, answers):
-            answer = re.search(pattern, answer[0]["content"]).group(1)
-            match = re.search(pattern, completion[0])
+            answer = re.search(r'<Output>(.*)</Output>', answer[0]["content"], re.DOTALL).group(1)
+            match = re.search(pattern, completion[0], re.DOTALL)
             if match:
                 pred0 = match.group(1)
             else:
                 pred0 = ""
-            match = re.search(pattern, completion[1])
+            match = re.search(pattern, completion[1], re.DOTALL)
             if match:
                 pred1 = match.group(1)
             else:
                 pred1 = ""
-            if pred0 == answer and pred1 == answer:
+            if grade_answer(pred0, answer) and grade_answer(pred1, answer):
                 ranks.append(1 if len(completion[0]) > len(completion[1]) else 0)
-            elif pred0 == answer:
+            elif grade_answer(pred0, answer):
                 ranks.append(0)
-            elif pred1 == answer:
+            elif grade_answer(pred1, answer):
                 ranks.append(1)
             else:
                 ranks.append(-1)
@@ -190,7 +199,7 @@ if __name__ == "__main__":
         ref_model=ref_model,
         judge=judge,
         args=training_args,
-        train_dataset=DpoDataset(os.path.join(script_args.dataset_name, "train_test.jsonl")),
+        train_dataset=DpoDataset(os.path.join(script_args.dataset_name, "train.jsonl")),
         eval_dataset=DpoDataset(os.path.join(script_args.dataset_name, "test.jsonl")),
         processing_class=tokenizer,
         reward_processing_class=reward_tokenizer,
